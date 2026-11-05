@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Probe</title>
+  <!-- Mirrors the visitor kiosk head: manifest only, no apple-mobile-web-app-capable (see Ember.cshtml). -->
+  <!-- use-credentials so the manifest request carries the dev tunnel's anti-phishing cookie if hosted there. -->
+  <link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+  <meta name="theme-color" content="#0f766e">
+  <style>
+    :root { color-scheme: light dark; --bg: #fff; --fg: #111; --muted: #666; --card: #f3f4f6; --accent: #0f766e; --bad: #b91c1c; --good: #15803d; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --muted: #999; --card: #1f2937; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 16px; font: 15px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    .card { background: var(--card); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; }
+    dt { color: var(--muted); }
+    dd { margin: 0; word-break: break-all; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+    button { font: inherit; padding: 10px 14px; border-radius: 6px; border: 0; background: var(--accent); color: #fff; }
+    button.secondary { background: var(--muted); }
+    video { width: 100%; max-height: 40vh; background: #000; border-radius: 6px; }
+    #permission[data-state="granted"] { color: var(--good); font-weight: bold; }
+    #permission[data-state="denied"] { color: var(--bad); font-weight: bold; }
+    #log { font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; margin: 0; max-height: 45vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Camera Probe</h1>
+
+  <div class="card">
+    <dl>
+      <dt>Display mode</dt><dd id="display-mode"></dd>
+      <dt>Navigation</dt><dd id="navigation"></dd>
+      <dt>Camera permission</dt><dd id="permission">unknown</dd>
+      <dt>Origin</dt><dd id="origin"></dd>
+      <dt>User agent</dt><dd id="user-agent"></dd>
+    </dl>
+  </div>
+
+  <div class="card buttons">
+    <button id="start">Start camera (check-in)</button>
+    <button id="stop" class="secondary">Stop camera</button>
+    <button id="reload">Reload (midnight)</button>
+    <button id="copy" class="secondary">Copy log</button>
+    <button id="clear" class="secondary">Clear log</button>
+  </div>
+
+  <div class="card">
+    <video id="preview" autoplay playsinline muted></video>
+    <dl>
+      <dt>Track settings</dt><dd id="track-settings">-</dd>
+      <dt>Video element</dt><dd id="video-size">-</dd>
+      <dt>Screen orientation</dt><dd id="orientation">-</dd>
+    </dl>
+  </div>
+
+  <div class="card">
+    <pre id="log"></pre>
+  </div>
+
+  <script>
+    const LOG_STORAGE_KEY = 'camera-probe-log';
+    const DISPLAY_MODES = ['fullscreen', 'standalone', 'minimal-ui', 'browser'];
+
+    const elements = Object.fromEntries(
+      ['display-mode', 'navigation', 'permission', 'origin', 'user-agent', 'start', 'stop', 'reload', 'copy', 'clear',
+       'preview', 'track-settings', 'video-size', 'orientation', 'log']
+        .map((id) => [id, document.getElementById(id)])
+    );
+
+    let activeStream = null;
+
+    function currentDisplayMode() {
+      return DISPLAY_MODES.find((mode) => matchMedia(`(display-mode: ${mode})`).matches) ?? 'unknown';
+    }
+
+    function readLog() {
+      try {
+        return JSON.parse(localStorage.getItem(LOG_STORAGE_KEY) ?? '[]');
+      } catch {
+        return [];
+      }
+    }
+
+    function writeLog(entries) {
+      try {
+        localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(entries));
+      } catch {
+        // Storage can be unavailable; the in-page log still renders below.
+      }
+    }
+
+    function formatEntry(entry) {
+      return `${entry.time}  [${entry.displayMode}]  ${entry.event}${entry.detail ? '  ' + entry.detail : ''}`;
+    }
+
+    function renderLog() {
+      elements['log'].textContent = readLog().slice().reverse().map(formatEntry).join('\n');
+    }
+
+    function log(event, detail = '') {
+      const entries = readLog();
+      entries.push({ time: new Date().toISOString(), displayMode: currentDisplayMode(), event, detail });
+      writeLog(entries);
+      renderLog();
+    }
+
+    async function queryCameraPermission() {
+      if (!navigator.permissions?.query) {
+        return 'unsupported';
+      }
+      try {
+        const status = await navigator.permissions.query({ name: 'camera' });
+        return status.state;
+      } catch (error) {
+        return `query failed: ${error.name}`;
+      }
+    }
+
+    function showPermission(state) {
+      elements['permission'].textContent = state;
+      elements['permission'].dataset.state = state;
+    }
+
+    async function watchPermission() {
+      if (!navigator.permissions?.query) {
+        showPermission('unsupported');
+        return;
+      }
+      try {
+        const status = await navigator.permissions.query({ name: 'camera' });
+        showPermission(status.state);
+        status.addEventListener('change', () => {
+          showPermission(status.state);
+          log('permission change', status.state);
+        });
+      } catch (error) {
+        showPermission(`query failed: ${error.name}`);
+      }
+    }
+
+    function showStreamDetails() {
+      const track = activeStream?.getVideoTracks()[0];
+      const settings = track?.getSettings() ?? {};
+      elements['track-settings'].textContent = track
+        ? `${settings.width}x${settings.height} facing=${settings.facingMode ?? '-'} label=${track.label}`
+        : '-';
+      const video = elements['preview'];
+      elements['video-size'].textContent = video.videoWidth ? `${video.videoWidth}x${video.videoHeight}` : '-';
+      elements['orientation'].textContent = `${screen.orientation?.type ?? '-'} (${innerWidth}x${innerHeight})`;
+    }
+
+    function stopCamera(reason) {
+      if (!activeStream) {
+        return;
+      }
+      activeStream.getTracks().forEach((track) => track.stop());
+      activeStream = null;
+      elements['preview'].srcObject = null;
+      showStreamDetails();
+      log('camera stopped', reason);
+    }
+
+    async function startCamera() {
+      stopCamera('restart');
+      const stateBefore = await queryCameraPermission();
+      const requestedAt = performance.now();
+      log('getUserMedia requested', `permission before=${stateBefore}`);
+      try {
+        activeStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        const elapsedMs = Math.round(performance.now() - requestedAt);
+        elements['preview'].srcObject = activeStream;
+        activeStream.getVideoTracks()[0].addEventListener('ended', () => log('track ended by browser'));
+        log('getUserMedia granted', `after ${elapsedMs}ms, permission after=${await queryCameraPermission()}`);
+      } catch (error) {
+        const elapsedMs = Math.round(performance.now() - requestedAt);
+        log('getUserMedia failed', `${error.name}: ${error.message} after ${elapsedMs}ms, permission after=${await queryCameraPermission()}`);
+      }
+      showStreamDetails();
+    }
+
+    async function copyLog() {
+      const text = readLog().map(formatEntry).join('\n');
+      try {
+        await navigator.clipboard.writeText(text);
+        log('log copied');
+      } catch (error) {
+        log('copy failed', error.name);
+      }
+    }
+
+    elements['start'].addEventListener('click', startCamera);
+    elements['stop'].addEventListener('click', () => stopCamera('stop button'));
+    elements['reload'].addEventListener('click', () => {
+      log('reload requested');
+      location.reload();
+    });
+    elements['copy'].addEventListener('click', copyLog);
+    elements['clear'].addEventListener('click', () => {
+      writeLog([]);
+      renderLog();
+    });
+    elements['preview'].addEventListener('loadedmetadata', showStreamDetails);
+    screen.orientation?.addEventListener('change', showStreamDetails);
+    document.addEventListener('visibilitychange', () => log('visibility', document.visibilityState));
+    matchMedia('(display-mode: browser)').addEventListener('change', () => log('display mode change', currentDisplayMode()));
+
+    elements['display-mode'].textContent = currentDisplayMode();
+    elements['origin'].textContent = location.origin;
+    elements['user-agent'].textContent = navigator.userAgent;
+    const navigationType = performance.getEntriesByType('navigation')[0]?.type ?? 'unknown';
+    elements['navigation'].textContent = navigationType;
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('service-worker.js').catch((error) => log('service worker failed', error.message));
+    }
+
+    watchPermission();
+    queryCameraPermission().then((state) => log('page load', `navigation=${navigationType}, permission=${state}, url=${location.pathname}${location.search}`));
+  </script>
+</body>
+</html>
